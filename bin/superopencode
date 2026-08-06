@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# superopencode - opencode with tmux session management
+# Twin of `superclaude`, but drives `opencode` instead of `claude`.
+
+set -euo pipefail
+
+# --auto = opencode's yolo flag: auto-approve anything not explicitly denied.
+# Explicit "deny" rules in opencode.json are still enforced.
+OPENCODE_CMD="${SO_OPENCODE_CMD:-opencode --auto}"
+SESSION_PREFIX="so"
+
+# Share Codeman's dedicated tmux socket so sessions created here are visible in
+# Codeman's web UI (and Codeman-created sessions are visible to `so`). Codeman
+# runs `tmux -L codeman` by default; mirror its own socket resolution so we stay
+# aligned even under CODEMAN_INSTANCE. Precedence: SO_TMUX_SOCKET override wins,
+# else CODEMAN_TMUX_SOCKET, else codeman[-<CODEMAN_INSTANCE>].
+SO_TMUX_SOCKET="${SO_TMUX_SOCKET:-${CODEMAN_TMUX_SOCKET:-codeman${CODEMAN_INSTANCE:+-${CODEMAN_INSTANCE}}}}"
+
+# All tmux calls go through the shared socket. (switch-client still respects the
+# current $TMUX when invoked from inside a session on this same socket.)
+tm() { tmux -L "$SO_TMUX_SOCKET" "$@"; }
+
+# --- helpers ---
+
+attach_or_switch() {
+    # switch-client when inside tmux (e.g. invoked from display-popup),
+    # attach-session otherwise.
+    # NB: use `exec tmux -L …` directly, not the `tm` function — `exec` replaces
+    # the shell with an external command and cannot exec a shell function.
+    if [[ -n "${TMUX:-}" ]]; then
+        exec tmux -L "$SO_TMUX_SOCKET" switch-client -t "=$1"
+    else
+        exec tmux -L "$SO_TMUX_SOCKET" attach-session -t "=$1"
+    fi
+}
+
+slug() {
+    local path="${1:-$(pwd)}"
+    # tmux rewrites '.' and ':' to '_' in session names (they're reserved in
+    # target specs as window.pane / session:window separators). Mirror that so
+    # the name we create matches the name we later attach to.
+    path="${path//[.:]/_}"
+    echo "${SESSION_PREFIX}|${path}"
+}
+
+list_sessions() {
+    local base_name
+    base_name="$(slug)"
+    tm list-sessions -F '#{session_name}' 2>/dev/null | grep -x "${base_name}\(-[0-9]\+\)\?" || true
+}
+
+next_session_name() {
+    local base_name
+    base_name="$(slug)"
+    local existing
+    existing="$(list_sessions)"
+
+    # If base session doesn't exist, use it
+    if ! echo "$existing" | grep -qx "$base_name"; then
+        echo "$base_name"
+        return
+    fi
+
+    # Find next available number
+    local i=2
+    while echo "$existing" | grep -qx "${base_name}-${i}"; do
+        ((i++))
+    done
+    echo "${base_name}-${i}"
+}
+
+usage() {
+    cat <<'EOF'
+superopencode - opencode with tmux session management
+
+Usage:
+  superopencode              Attach to existing session or create one
+  superopencode new          Create a new session (auto-numbered)
+  superopencode list         List sessions for current directory
+  superopencode list all     Interactive picker (fzf) over ALL so sessions
+  superopencode attach NAME  Attach to a specific session
+  superopencode kill NAME    Kill a specific session
+  superopencode help         Show this help
+
+Any other arguments are passed directly to opencode.
+
+Env:
+  SO_OPENCODE_CMD   override the launch command (default: "opencode --auto")
+  SO_TMUX_SOCKET    override the tmux socket (default: Codeman's)
+EOF
+}
+
+pick_and_attach_all() {
+    # One row per session: first active pane (lowest window_index — base-index aware).
+    # pane_current_path is the real cwd (more accurate than parsing the -N suffix
+    # off the slug); pane_title is whatever the agent set, often just the cwd.
+    local rows
+    rows="$(tm list-panes -a \
+        -F $'#{session_name}\t#{pane_active}\t#{session_attached}\t#{session_activity}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}' \
+        2>/dev/null \
+        | awk -F'\t' -v p="^${SESSION_PREFIX}\\|" '$1 ~ p && $2=="1" && !seen[$1]++' \
+        | sort -t$'\t' -k4 -nr || true)"
+
+    if [[ -z "$rows" ]]; then
+        echo "No superopencode sessions running"
+        return 0
+    fi
+
+    if ! command -v fzf >/dev/null 2>&1; then
+        echo "fzf not installed; sessions:" >&2
+        echo "$rows" | cut -f1
+        return 1
+    fi
+
+    local selected=""
+    selected="$(
+        while IFS=$'\t' read -r name pactive attached activity cmd cwd title; do
+            local marker=" "
+            [[ "$attached" != "0" ]] && marker="●"
+            local ts
+            ts="$(date -d "@$activity" '+%m-%d %H:%M' 2>/dev/null || echo '-----')"
+            # opencode doesn't publish a conversation summary to the pane title the
+            # way Claude Code does, so fall back to the cwd when it's uninformative.
+            local label="$title"
+            [[ -z "$label" || "$label" == "$cwd" || "$label" == "$(hostname)" \
+               || "${label,,}" == "opencode" ]] && label="$cwd"
+            # If opencode isn't the foreground process, mark the row so it's obvious.
+            [[ "$cmd" != "opencode" ]] && label="[${cmd}] ${label}"
+            printf '%s\t%s  %s  %-50.50s  %s\n' "$name" "$marker" "$ts" "$label" "$cwd"
+        done <<< "$rows" \
+        | fzf --with-nth=2.. --delimiter=$'\t' \
+              --prompt='session> ' --header='● attached   enter: attach   esc: cancel' \
+              --height=60% --reverse --no-multi \
+        | cut -f1
+    )" || selected=""
+
+    if [[ -n "$selected" ]]; then
+        attach_or_switch "$selected"
+    fi
+}
+
+create_and_attach() {
+    local session_name="$1"
+    tm new-session -d -s "$session_name" -c "$(pwd)" "$OPENCODE_CMD"
+    echo "Created session: $session_name"
+    attach_or_switch "$session_name"
+}
+
+# --- main ---
+
+case "${1:-}" in
+    "")
+        # No args: attach to existing session or create one
+        existing="$(list_sessions | head -1)"
+        if [[ -n "$existing" ]]; then
+            echo "Attaching to: $existing"
+            attach_or_switch "$existing"
+        else
+            create_and_attach "$(slug)"
+        fi
+        ;;
+    new)
+        session_name="$(next_session_name)"
+        create_and_attach "$session_name"
+        ;;
+    list)
+        if [[ "${2:-}" == "all" ]]; then
+            pick_and_attach_all
+        else
+            sessions="$(list_sessions)"
+            if [[ -z "$sessions" ]]; then
+                echo "No sessions for $(pwd)"
+            else
+                echo "Sessions for $(pwd):"
+                echo "$sessions"
+            fi
+        fi
+        ;;
+    attach)
+        if [[ -z "${2:-}" ]]; then
+            echo "Usage: superopencode attach SESSION_NAME"
+            exit 1
+        fi
+        attach_or_switch "$2"
+        ;;
+    kill)
+        if [[ -z "${2:-}" ]]; then
+            echo "Usage: superopencode kill SESSION_NAME"
+            exit 1
+        fi
+        tm kill-session -t "=$2"
+        echo "Killed session: $2"
+        ;;
+    help|--help|-h)
+        usage
+        ;;
+    *)
+        # Pass everything through to opencode
+        exec $OPENCODE_CMD "$@"
+        ;;
+esac

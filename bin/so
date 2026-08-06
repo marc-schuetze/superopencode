@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# so - mobile-friendly superopencode session picker (fzf UI)
+# `so`     -> fzf picker over all so sessions, with "new session" at top
+# `so n`   -> create new session in $PWD
+# `so <N>` -> attach directly to N-th session (most-recent first)
+
+set -euo pipefail
+
+SESSION_PREFIX="so"
+
+# Share Codeman's dedicated tmux socket (see bin/superopencode for rationale).
+SO_TMUX_SOCKET="${SO_TMUX_SOCKET:-${CODEMAN_TMUX_SOCKET:-codeman${CODEMAN_INSTANCE:+-${CODEMAN_INSTANCE}}}}"
+tm() { tmux -L "$SO_TMUX_SOCKET" "$@"; }
+
+attach_or_switch() {
+    # switch-client when inside tmux (e.g. invoked from display-popup),
+    # attach-session otherwise.
+    # NB: use `exec tmux -L …` directly, not the `tm` function — `exec` replaces
+    # the shell with an external command and cannot exec a shell function.
+    if [[ -n "${TMUX:-}" ]]; then
+        exec tmux -L "$SO_TMUX_SOCKET" switch-client -t "=$1"
+    else
+        exec tmux -L "$SO_TMUX_SOCKET" attach-session -t "=$1"
+    fi
+}
+
+list_rows() {
+    tm list-panes -a \
+        -F $'#{session_name}\t#{pane_active}\t#{session_attached}\t#{session_activity}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}' \
+        2>/dev/null \
+        | awk -F'\t' -v p="^${SESSION_PREFIX}[|]" '$1 ~ p && $2=="1" && !seen[$1]++' \
+        | sort -t$'\t' -k4 -nr || true
+}
+
+reltime() {
+    local t="$1" now diff
+    now="$(date +%s)"
+    diff=$(( now - t ))
+    if   (( diff < 60 ));     then echo "${diff}s"
+    elif (( diff < 3600 ));   then echo "$((diff/60))m"
+    elif (( diff < 86400 ));  then echo "$((diff/3600))h"
+    elif (( diff < 604800 )); then echo "$((diff/86400))d"
+    else echo "$((diff/604800))w"
+    fi
+}
+
+basename_of() {
+    local p="${1/#$HOME/~}"
+    [[ "$p" == "~" ]] && { echo "~"; return; }
+    p="${p%/}"
+    echo "${p##*/}"
+}
+
+attach_nth() {
+    local rows="$1" n="$2"
+    local name
+    name="$(echo "$rows" | awk -F'\t' -v n="$n" 'NR==n {print $1}')"
+    if [[ -z "$name" ]]; then
+        echo "no session #$n" >&2
+        return 1
+    fi
+    attach_or_switch "$name"
+}
+
+build_menu() {
+    local rows="$1"
+    printf ' +  new session in %s\t__NEW__\n' "$(basename_of "$PWD")"
+    local i=0
+    while IFS=$'\t' read -r name pactive attached activity cmd cwd title; do
+        [[ -z "$name" ]] && continue
+        i=$((i+1))
+        local marker="·"
+        [[ "$attached" != "0" ]] && marker="●"
+        local rt; rt="$(reltime "$activity")"
+        local dir; dir="$(basename_of "$cwd")"
+        # opencode doesn't publish a conversation summary to the pane title, so
+        # the directory is usually the only useful label.
+        local label="$title"
+        [[ -z "$label" || "$label" == "$cwd" || "$label" == "$(hostname)" \
+           || "${label,,}" == "opencode" ]] && label="$dir"
+        [[ "$cmd" != "opencode" ]] && label="[${cmd}] ${label}"
+        printf '%2d %s %3s  %s  ·  %s\t%s\n' "$i" "$marker" "$rt" "$label" "$dir" "$name"
+    done <<< "$rows"
+}
+
+picker() {
+    local rows="$1"
+    local picked
+    picked="$(build_menu "$rows" \
+        | fzf --with-nth=1 --delimiter=$'\t' \
+              --no-info --no-scrollbar --reverse --height=100% \
+              --border=none --margin=0 --padding=0 \
+              --pointer='>' --prompt='so > ' \
+              --header='● attached · enter:attach · esc:cancel' \
+              --color='prompt:cyan,pointer:cyan,header:dim' \
+        | cut -f2)" || picked=""
+
+    [[ -z "$picked" ]] && exit 0
+    if [[ "$picked" == "__NEW__" ]]; then
+        exec superopencode new
+    fi
+    attach_or_switch "$picked"
+}
+
+case "${1:-}" in
+    n|new)
+        exec superopencode new
+        ;;
+    [0-9]*)
+        rows="$(list_rows)"
+        attach_nth "$rows" "$1"
+        ;;
+    -h|--help|help)
+        cat <<'EOF'
+so - short superopencode session picker (fzf UI)
+
+  so          fzf picker over all so sessions ("new session" at top)
+  so n        new session in $PWD
+  so <N>      attach directly to N-th session (most-recent first)
+EOF
+        ;;
+    "")
+        rows="$(list_rows)"
+        if [[ -z "$rows" ]]; then
+            echo "No sessions. Creating new in $PWD..."
+            exec superopencode new
+        fi
+        picker "$rows"
+        ;;
+    *)
+        echo "unknown: $1 (try: so, so n, so <N>)" >&2
+        exit 1
+        ;;
+esac
