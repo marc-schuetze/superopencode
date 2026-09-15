@@ -8,7 +8,7 @@ opencode with sticky per-directory tmux sessions. Twin of `superclaude`, third i
 Clone anywhere, then symlink both scripts onto your `PATH`:
 
 ```sh
-git clone https://github.com/scharc/superopencode.git
+git clone https://github.com/marc-schuetze/superopencode.git
 cd superopencode
 ln -sfn "$PWD/bin/superopencode" ~/.local/bin/superopencode
 ln -sfn "$PWD/bin/so"            ~/.local/bin/so
